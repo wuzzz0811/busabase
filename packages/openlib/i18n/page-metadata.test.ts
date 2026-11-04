@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createPageMetadataHelpers, FALLBACK_SELF_ALTERNATES } from "./page-metadata";
+import {
+  createPageMetadataHelpers,
+  ENGLISH_ONLY_LOCALES,
+  FALLBACK_SELF_ALTERNATES,
+} from "./page-metadata";
 
 const LOCALES = ["en", "zh-CN", "zh-TW", "ja"] as const;
 
@@ -387,6 +391,59 @@ describe("absoluteTitle", () => {
     expect(metadata.title).toEqual({ absolute: "GPT-6 Astra for Agent Workflows | Buda" });
   });
 
+  describe("with a brandName", () => {
+    const branded = createPageMetadataHelpers({
+      baseUrl: "https://example.com",
+      defaultLocale: "en",
+      supportedLocales: LOCALES,
+      defaultImageUrl: "https://example.com/opengraph-image",
+      brandName: "Buda",
+    });
+    const metadataTitle = (title: string) =>
+      branded.generatePageMetadata({ title, description: "D", path: "/x", lang: "en" }).title;
+
+    it("leaves a title that does not name the brand to the layout's template", () => {
+      expect(metadataTitle("Pricing")).toBe("Pricing");
+    });
+
+    it("emits a title that already names the brand as absolute, in any script", () => {
+      expect(metadataTitle("How Buda works")).toEqual({ absolute: "How Buda works" });
+      expect(metadataTitle("Buda 如何运作")).toEqual({ absolute: "Buda 如何运作" });
+      expect(metadataTitle("关于：我们为什么做Buda")).toEqual({
+        absolute: "关于：我们为什么做Buda",
+      });
+    });
+
+    it("does not read a longer word as the brand", () => {
+      expect(metadataTitle("Busabase in Budapest")).toBe("Busabase in Budapest");
+      expect(branded.brandedTitle("Budapest")).toBe("Budapest | Buda");
+    });
+
+    it("gives a hand-built page the same single brand", () => {
+      expect(branded.brandedTitle("Pricing")).toBe("Pricing | Buda");
+      expect(branded.brandedTitle("X | Buda")).toBe("X | Buda");
+    });
+  });
+
+  it("reads a brandName with regex characters literally", () => {
+    const dotted = createPageMetadataHelpers({
+      baseUrl: "https://tabcy.ai",
+      defaultLocale: "en",
+      supportedLocales: ["en"],
+      defaultImageUrl: "https://tabcy.ai/og.png",
+      brandName: "Tabcy.ai",
+    });
+    expect(dotted.brandedTitle("About Tabcy.ai")).toBe("About Tabcy.ai");
+    expect(dotted.brandedTitle("About Tabcyxai")).toBe("About Tabcyxai | Tabcy.ai");
+  });
+
+  it("changes nothing for an app without a brandName", () => {
+    expect(
+      generatePageMetadata({ title: "Buda", description: "D", path: "/x", lang: "en" }).title,
+    ).toBe("Buda");
+    expect(helpers.brandedTitle("Pricing")).toBe("Pricing");
+  });
+
   it("keeps og:title and twitter:title as the bare string, template or not", () => {
     // The template is a <title> concern; leaking `{ absolute }` into a share card
     // would serialize an object where a string belongs.
@@ -636,5 +693,45 @@ describe("a static route translated into only some locales", () => {
     expect(() =>
       generateTranslatedPageMetadata({ ...base, lang: "ja", translatedLocales: ["zh-CN"] }),
     ).toThrow(/default locale/);
+  });
+});
+
+describe("getTranslatedPageAlternates", () => {
+  const { getTranslatedPageAlternates, generateTranslatedPageMetadata } = helpers;
+
+  it("gives a translated locale its own canonical and a fallback locale the English one", () => {
+    const set = ["en", "zh-CN"];
+    expect(getTranslatedPageAlternates("zh-CN", "/plans", set).url).toBe(
+      "https://example.com/zh-CN/plans",
+    );
+    const fallback = getTranslatedPageAlternates("ja", "/plans", set);
+    expect(fallback.url).toBe("https://example.com/plans");
+    expect(fallback.alternates).toEqual({
+      canonical: "https://example.com/plans",
+      languages: {
+        en: "https://example.com/plans",
+        "zh-CN": "https://example.com/zh-CN/plans",
+        "x-default": "https://example.com/plans",
+      },
+    });
+  });
+
+  it("matches what generateTranslatedPageMetadata emits, for the root path too", () => {
+    for (const lang of ["en", "zh-CN", "ja"]) {
+      const { url, alternates } = getTranslatedPageAlternates(lang, "", ENGLISH_ONLY_LOCALES);
+      const meta = generateTranslatedPageMetadata({
+        title: "t",
+        description: "d",
+        path: "",
+        lang,
+        translatedLocales: ENGLISH_ONLY_LOCALES,
+      });
+      expect(url).toBe("https://example.com");
+      expect(alternates).toEqual(meta.alternates);
+    }
+  });
+
+  it("refuses a set without the default locale", () => {
+    expect(() => getTranslatedPageAlternates("ja", "/plans", ["zh-CN"])).toThrow(/default locale/);
   });
 });

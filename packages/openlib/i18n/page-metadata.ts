@@ -90,6 +90,12 @@ import { createCanonicalUrlHelpers } from "./canonical-url";
 export const FALLBACK_SELF_ALTERNATES: { canonical: string } = { canonical: "./" };
 
 /**
+ * `translatedLocales` of a page whose body exists only in English: a hard-coded page, a legal text,
+ * a hub that was never translated. A page with copy in several locales names its own set instead.
+ */
+export const ENGLISH_ONLY_LOCALES = ["en"] as const;
+
+/**
  * Minimal shape of the subset of Next.js's `Metadata` type this module
  * returns. Deliberately not `import type { Metadata } from "next"` — that
  * would be a static type import of Next's ambient global declarations into
@@ -173,6 +179,16 @@ export interface PageAlternatesHelpers {
     path: string,
     availableLocales: readonly string[],
   ): PageUrlAndAlternates;
+  /**
+   * STATIC route translated into only SOME locales: the same locale-fallback facts as
+   * `generateTranslatedPageMetadata`, for a page that assembles its own Metadata. Any other locale
+   * gets the default-locale URL as its canonical, and hreflang is exactly `translatedLocales`.
+   */
+  getTranslatedPageAlternates(
+    locale: string,
+    path: string,
+    translatedLocales: readonly string[],
+  ): PageUrlAndAlternates;
 }
 
 /**
@@ -221,6 +237,22 @@ function toOpenGraphLocale(
 }
 
 /**
+ * The locale whose body a request for `locale` is served on a partly translated static route.
+ * Every other locale gets the default-locale body, so without it there is no page to canonicalize
+ * to: a caller bug, which fails on the first render rather than shipping a wrong <head>.
+ */
+function resolveTranslatedLocale(
+  locale: string,
+  translatedLocales: readonly string[],
+  defaultLocale: string,
+): string {
+  if (!translatedLocales.includes(defaultLocale)) {
+    throw new Error(`translatedLocales must include the default locale "${defaultLocale}"`);
+  }
+  return translatedLocales.includes(locale) ? locale : defaultLocale;
+}
+
+/**
  * Create locale-aware canonical URL helpers bound to an app's base URL and locale config.
  */
 export function createPageAlternatesHelpers<T extends string>(
@@ -253,7 +285,18 @@ export function createPageAlternatesHelpers<T extends string>(
   const getPageAlternates = (locale: string, path = ""): PageUrlAndAlternates =>
     getContentPageAlternates(locale, path, supportedLocales);
 
-  return { getPageAlternates, getContentPageAlternates };
+  const getTranslatedPageAlternates = (
+    locale: string,
+    path: string,
+    translatedLocales: readonly string[],
+  ): PageUrlAndAlternates =>
+    getContentPageAlternates(
+      resolveTranslatedLocale(locale, translatedLocales, defaultLocale),
+      path,
+      translatedLocales,
+    );
+
+  return { getPageAlternates, getContentPageAlternates, getTranslatedPageAlternates };
 }
 
 export interface PageMetadataConfig<T extends string> extends PageAlternatesConfig<T> {
@@ -275,6 +318,13 @@ export interface PageMetadataConfig<T extends string> extends PageAlternatesConf
    * route). Without it, `imageText` is ignored and `defaultImageUrl` is used.
    */
   buildImageTextUrl?: (text: string) => string;
+  /**
+   * The brand the app's `title.template` appends (e.g. "Buda" for `%s | Buda`). Next's template
+   * cannot look at the title it decorates, so a title that already names the brand — "How Buda
+   * works", an editor's "X | Buda" — would carry it twice. With this set, such a title is emitted
+   * `{ absolute }`; every other title still flows through the template. See `brandedTitle`.
+   */
+  brandName?: string;
 }
 
 export interface GeneratePageMetadataOptions {
@@ -326,8 +376,8 @@ export interface GeneratePageMetadataOptions {
    * Treat `title` as the COMPLETE document title and bypass the root layout's
    * `title.template`.
    *
-   * A template like `Buda AI - %s` exists for pages that supply a fragment
-   * ("Pricing" -> "Buda AI - Pricing"). A CMS `seo-title` is not a fragment: an
+   * A template like `%s | Buda` exists for pages that supply a fragment
+   * ("Pricing" -> "Pricing | Buda"). A CMS `seo-title` is not a fragment: an
    * editor authored the whole title, brand included. Running it through the
    * template anyway is what produced the live
    * `Buda AI - GPT-6 Astra for Agent Workflows | Buda` — the brand twice, and a
@@ -393,6 +443,13 @@ export interface PageMetadataHelpers extends PageAlternatesHelpers {
    */
   generatePageMetadata(options: GeneratePageMetadataOptions): PageMetadata;
   /**
+   * The complete title for a page that builds its own metadata instead of calling the helpers:
+   * `title` as-is when it already names `brandName`, otherwise `title | brandName`. Use it as
+   * `title: { absolute: brandedTitle(x) }` and for the share-card titles, so the brand appears
+   * once. Returns `title` unchanged when the app sets no `brandName`.
+   */
+  brandedTitle(title: string): string;
+  /**
    * CONTENT route: identical output shape, but `availableLocales` is required so
    * the hreflang set can only come from the content source, never from a default.
    */
@@ -434,12 +491,24 @@ export function createPageMetadataHelpers<T extends string>(
     twitterCreator,
     openGraphLocales,
     buildImageTextUrl,
+    brandName,
     ...alternatesConfig
   } = config;
-  const { getPageAlternates, getContentPageAlternates } =
+  const { getPageAlternates, getContentPageAlternates, getTranslatedPageAlternates } =
     createPageAlternatesHelpers(alternatesConfig);
 
   const getOpenGraphLocale = (locale: string) => toOpenGraphLocale(locale, openGraphLocales);
+
+  // Bounded by Latin letters and digits only: "Budapest" is not the brand "Buda", but CJK text runs
+  // straight into it ("为什么做Buda") and that is.
+  const brandPattern = brandName
+    ? new RegExp(
+        `(^|[^A-Za-z0-9])${brandName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9])`,
+      )
+    : null;
+  const namesBrand = (title: string) => brandPattern?.test(title) ?? false;
+  const brandedTitle = (title: string) =>
+    !brandName || namesBrand(title) ? title : `${title} | ${brandName}`;
 
   const getOpenGraphAlternateLocales = (
     locale: string,
@@ -482,7 +551,7 @@ export function createPageMetadataHelpers<T extends string>(
     return {
       // og:title / twitter:title always stay the bare string — the template is a
       // document-title concern and must not leak into share cards.
-      title: absoluteTitle ? { absolute: title } : title,
+      title: absoluteTitle || namesBrand(title) ? { absolute: title } : title,
       description,
       ...(keywords?.length ? { keywords: [...keywords] } : {}),
       alternates,
@@ -526,15 +595,11 @@ export function createPageMetadataHelpers<T extends string>(
     translatedLocales,
     ...options
   }: GenerateTranslatedPageMetadataOptions): PageMetadata => {
-    const { defaultLocale } = alternatesConfig;
-    if (!translatedLocales.includes(defaultLocale)) {
-      // Every other locale is served the default-locale body, so without it there is no page to
-      // canonicalize to. A caller bug — fail on the first render rather than ship a wrong <head>.
-      throw new Error(
-        `generateTranslatedPageMetadata: translatedLocales must include the default locale "${defaultLocale}"`,
-      );
-    }
-    const contentLang = translatedLocales.includes(options.lang) ? options.lang : defaultLocale;
+    const contentLang = resolveTranslatedLocale(
+      options.lang,
+      translatedLocales,
+      alternatesConfig.defaultLocale,
+    );
     return generateContentPageMetadata({
       ...options,
       canonicalLang: contentLang,
@@ -546,9 +611,11 @@ export function createPageMetadataHelpers<T extends string>(
   return {
     getPageAlternates,
     getContentPageAlternates,
+    getTranslatedPageAlternates,
     generatePageMetadata,
     generateContentPageMetadata,
     generateTranslatedPageMetadata,
+    brandedTitle,
     getOpenGraphLocale,
     getOpenGraphAlternateLocales,
   };
