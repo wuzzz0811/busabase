@@ -1,0 +1,25 @@
+import { type SQL, sql } from "drizzle-orm";
+import { busabaseCommits } from "../../../db/schema";
+
+/**
+ * Keep only the named top-level keys of a commit payload, inside PostgreSQL, so
+ * a read that needs one field never ships every multi-megabyte sibling to Node.
+ * Missing keys are simply absent, the same as reading them from the full payload.
+ */
+export const commitPayloadWithFields = (slugs: Iterable<string>): SQL<Record<string, unknown>> => {
+  const unique = [...new Set(slugs)];
+  if (unique.length === 0) {
+    return sql<Record<string, unknown>>`'{}'::jsonb`;
+  }
+  return sql<Record<string, unknown>>`coalesce(
+    (
+      select jsonb_object_agg(payload_entry.key, payload_entry.value)
+      from jsonb_each(${busabaseCommits.payload}) as payload_entry(key, value)
+      where payload_entry.key in (${sql.join(
+        unique.map((slug) => sql`${slug}`),
+        sql`, `,
+      )})
+    ),
+    '{}'::jsonb
+  )`;
+};

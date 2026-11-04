@@ -241,6 +241,16 @@ export const listRecordsPageInputSchema = z.object({
     .string()
     .min(1)
     .describe("Required here, unlike `records.list` where omitting it spans the whole space."),
+  listMode: z
+    .enum(["full", "table"])
+    .optional()
+    .default("full")
+    .describe(
+      "`full` returns complete record payloads. `table` is the explicit compact mode for " +
+        "Table/Grid views: values larger than 4 KB are replaced with omission markers while " +
+        "the Base schema and computed lookup metadata stay available for cell rendering. " +
+        "Use records.get to read a selected record's complete content.",
+    ),
   viewId: z
     .string()
     .min(1)

@@ -20,7 +20,7 @@ import { customAgentPromptsSchema } from "./node-agent-prompt-schemas";
 import { PlaybookAttributionVOSchema } from "./playbook-schemas";
 
 /** @see nodeSettingsSchema — declared here so `NodeOutput` can reference it. */
-export type NodeSettings = { airappEngine?: "browser" | "local" | "remote" | null };
+export type NodeSettings = { airappEngine?: "browser" | "local" | "remote" | "site" | null };
 
 export interface NodeOutput {
   id: string;
@@ -336,7 +336,7 @@ export const nodeSettingsSchema = z.strictObject({
    * must stay distinguishable from any particular value; `null` clears an
    * override and returns the node to following the app.
    */
-  airappEngine: z.enum(["browser", "local", "remote"]).nullish(),
+  airappEngine: z.enum(["browser", "local", "remote", "site"]).nullish(),
 });
 
 const updateNodeSettingsInputSchema = z.object({

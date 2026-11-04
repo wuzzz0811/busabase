@@ -76,7 +76,8 @@ import {
   groupKeyForValue,
 } from "../utils/view-records";
 
-import { lookupDependentFieldSlugs } from "./lookup-formulas";
+import { commitPayloadWithFields } from "./commit-payload-projection";
+import { lookupDependentFieldSlugs, lookupFormulaInputSlugs } from "./lookup-formulas";
 import { assertNoReverseRelationQueryOrThrow, collectFieldSlugs } from "./reverse-relations";
 
 export { listInputSchema, recordFieldFilterInputSchema, recordFieldGetInputSchema };
@@ -958,6 +959,19 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
   await ensureReady();
   const db = await getDb();
   const parsed = listRecordsPageInputSchema.parse(input);
+  const tableListMode = parsed.listMode === "table";
+  const hydratePageRows = (rows: RecordPO[]) =>
+    hydrateRecords(
+      rows,
+      tableListMode
+        ? {
+            summary: true,
+            preserveBaseSchema: true,
+            includeComputedFields: true,
+            keepWhiteboardPreview: true,
+          }
+        : undefined,
+    );
   const base = await getBase(parsed.baseId);
   if (!base) {
     throw new ORPCError("NOT_FOUND", { message: `Base not found: ${parsed.baseId}` });
@@ -1088,7 +1102,7 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
       .limit(parsed.pageSize)
       .offset(offset);
     return {
-      records: await hydrateRecords(rows),
+      records: await hydratePageRows(rows),
       total,
       totalPages,
       page,
@@ -1119,17 +1133,20 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
     ...(effectiveViewConfig?.sorts ?? []).map((sort) => sort.fieldSlug),
     ...(explicitDynamicSort && parsed.sort ? [parsed.sort.fieldSlug] : []),
   ]);
-  const dynamicSlugs = lookupDependentFieldSlugs(base.fields);
-  const dependsOnLookup = [...viewFieldSlugs].some(
-    (slug) => slug !== undefined && dynamicSlugs.has(slug),
+  const viewEvaluationSlugs = [...viewFieldSlugs].filter(
+    (slug): slug is string => slug !== undefined,
   );
+  const dynamicSlugs = lookupDependentFieldSlugs(base.fields);
+  const dependsOnLookup = viewEvaluationSlugs.some((slug) => dynamicSlugs.has(slug));
 
   if (!dependsOnLookup) {
     const candidateRows = await db
       .select({
         id: busabaseRecords.id,
         updatedAt: busabaseRecords.updatedAt,
-        fields: busabaseCommits.payload,
+        // Membership and order read only the fields the view names. Project them
+        // in SQL so a filter on a short status never loads every report body.
+        fields: commitPayloadWithFields(viewEvaluationSlugs).as("fields"),
       })
       .from(busabaseRecords)
       .innerJoin(busabaseCommits, eq(busabaseCommits.id, busabaseRecords.headCommitId))
@@ -1157,7 +1174,7 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
     // Hydrate only the page, then restore the order the view decided (the
     // WHERE ... IN read comes back in whatever order the engine likes).
     const pageRecords = pageIds.length
-      ? await hydrateRecords(
+      ? await hydratePageRows(
           await db.select().from(busabaseRecords).where(inArray(busabaseRecords.id, pageIds)),
         )
       : [];
@@ -1179,7 +1196,11 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
     .from(busabaseRecords)
     .where(and(...recordFilters))
     .orderBy(...candidateOrder);
-  const candidates = await hydrateRecords(candidateRows);
+  // These rows only decide membership and order, so they carry the view's fields
+  // plus the inputs of read-time formulas. The page itself is hydrated below.
+  const candidates = await hydrateRecords(candidateRows, {
+    payloadFields: [...viewEvaluationSlugs, ...lookupFormulaInputSlugs(base.fields)],
+  });
   const ordered =
     explicitDynamicSort && parsed.sort
       ? sortHydratedRecords(
@@ -1194,9 +1215,19 @@ export const listRecordsPage = async (input: z.input<typeof listRecordsPageInput
   const totalPages = Math.ceil(total / parsed.pageSize);
   const page = totalPages === 0 ? 1 : Math.min(parsed.page, totalPages);
   const offset = (page - 1) * parsed.pageSize;
+  const pageIds = ordered.slice(offset, offset + parsed.pageSize).map((record) => record.id);
+  const pageRecords = pageIds.length
+    ? await hydratePageRows(
+        await db.select().from(busabaseRecords).where(inArray(busabaseRecords.id, pageIds)),
+      )
+    : [];
+  const pageRecordsById = new Map(pageRecords.map((record) => [record.id, record]));
 
   return {
-    records: ordered.slice(offset, offset + parsed.pageSize),
+    records: pageIds.flatMap((recordId) => {
+      const record = pageRecordsById.get(recordId);
+      return record ? [record] : [];
+    }),
     total,
     totalPages,
     page,

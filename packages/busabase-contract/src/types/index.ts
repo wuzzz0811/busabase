@@ -166,7 +166,7 @@ export interface NodeVO {
    * "follow the app" — `airapp.json` decides — which is why absence has to stay
    * distinguishable from any particular value.
    */
-  settings?: { airappEngine?: "browser" | "local" | "remote" | null };
+  settings?: { airappEngine?: "browser" | "local" | "remote" | "site" | null };
   /**
    * This node's OWN declared visibility, or null when it inherits from its
    * ancestors. A real column rather than a metadata key, because it is the node
@@ -410,7 +410,9 @@ export type {
   FilePreviewProvider,
   FilePreviewUnavailableReason,
   FilePreviewVO,
+  FileTreeEntriesVO,
   FileTreeFileVO,
+  FileTreeFolderEntryVO,
   FileTreeNodeVO,
   FileTreeReadFileVO,
 } from "../domains/filetree/types";

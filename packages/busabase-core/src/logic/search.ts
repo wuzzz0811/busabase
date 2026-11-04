@@ -20,7 +20,6 @@ import {
   isNotNull,
   isNull,
   lte,
-  notExists,
   or,
   sql,
 } from "drizzle-orm";
@@ -54,7 +53,6 @@ import {
   buildNodeVisibilityCondition,
   buildNodeVisibilityExists,
 } from "./node-acl";
-import { isSearchableNodeType, reindexNodeContent, SEARCHABLE_NODE_TYPES } from "./node-content";
 import { collectSubtreeIds } from "./nodes";
 import {
   getSearchExecutionOutcome,
@@ -63,6 +61,7 @@ import {
 } from "./search-execution";
 import { recordSearchRequest } from "./search-metrics";
 import { literalSearchPattern, recordSearchSource } from "./search-record-query";
+import { healNodeProjections } from "./search-self-heal";
 import { ensureReady } from "./seed";
 import { toBaseVO } from "./vo";
 
@@ -344,17 +343,9 @@ const fileResultHref = (nodeType: string, nodeSlug: string) => {
  * `VALUE_TEXT_INDEX_LIMIT`. See `content/spec/node-content-search.md`.
  */
 const NODE_SNIPPET_RADIUS = 60;
-/**
- * How many unindexed nodes one search request will index before querying.
- *
- * Bounded on purpose: a workspace upgraded from before this feature has no
- * projection rows, and indexing them all in the first search would make that
- * one request arbitrarily slow — worst on the largest workspaces, which are
- * exactly the ones that need search most. A small batch per request lets the
- * index fill in across a few searches instead (spec D3: gradually, never a
- * stalled request).
- */
-const NODE_SELF_HEAL_BATCH = 25;
+/** How long a search waits for the backfill it started; the rest finishes behind it. */
+const QUICK_SELF_HEAL_WAIT_MS = 300;
+const FULL_SELF_HEAL_WAIT_MS = 1_000;
 
 /** A snippet centred on the match, so the user can tell near-identical docs apart (spec S1). */
 const buildNodeSnippet = (content: string, query: string): string => {
@@ -378,44 +369,6 @@ const NODE_KIND_LABEL: Record<string, string> = {
 };
 
 /**
- * Index up to `NODE_SELF_HEAL_BATCH` content-bearing nodes that have no
- * projection row yet — the lazy backfill for workspaces that predate this
- * feature (spec D3). Fail-soft per node: a missing content object leaves that
- * node unindexed and retried next time rather than failing the search.
- */
-const selfHealNodeProjections = async (
-  db: DbInstance,
-  spaceId: string,
-  execution: SearchExecution,
-): Promise<void> => {
-  await execution.beforeQuery();
-  const stale = await execution.query(async (queryDb) =>
-    queryDb
-      .select({ id: busabaseNodes.id, type: busabaseNodes.type })
-      .from(busabaseNodes)
-      .where(
-        and(
-          eq(busabaseNodes.spaceId, spaceId),
-          isNull(busabaseNodes.archivedAt),
-          inArray(busabaseNodes.type, SEARCHABLE_NODE_TYPES),
-          notExists(
-            db
-              .select({ one: sql`1` })
-              .from(busabaseNodeContentSearch)
-              .where(eq(busabaseNodeContentSearch.nodeId, busabaseNodes.id)),
-          ),
-        ),
-      )
-      .limit(NODE_SELF_HEAL_BATCH),
-  );
-  for (const node of stale) {
-    await execution.beforeQuery();
-    if (!isSearchableNodeType(node.type)) continue;
-    await reindexNodeContent(db, { nodeId: node.id, spaceId, nodeType: node.type });
-  }
-};
-
-/**
  * Search node content. Node ACL is applied INSIDE this query, never after —
  * post-filtering would both over-count `hasMore` and let a caller infer that
  * hidden nodes exist (spec D4).
@@ -426,9 +379,14 @@ const searchNodeContent = async (
   query: string,
   limit: number,
   narrow: SearchNarrowing,
+  mode: "quick" | "full",
   execution: SearchExecution,
 ): Promise<{ results: SortableResult[]; truncated: boolean }> => {
-  await selfHealNodeProjections(db, spaceId, execution);
+  const indexComplete = await healNodeProjections(
+    db,
+    spaceId,
+    mode === "quick" ? QUICK_SELF_HEAL_WAIT_MS : FULL_SELF_HEAL_WAIT_MS,
+  );
   await execution.beforeQuery();
   const pattern = literalSearchPattern(query);
   // One budgeted scope for both statements: the matches and the truncation
@@ -516,7 +474,7 @@ const searchNodeContent = async (
         updatedAt: row.updatedAt?.toISOString() ?? null,
       }),
     })),
-    truncated: truncatedInScope !== undefined,
+    truncated: truncatedInScope !== undefined || !indexComplete,
   };
 };
 
@@ -534,6 +492,9 @@ const fileMatchesQuery = (query: string, ...values: (string | null | undefined)[
  * metadata across many large `present`-status text files could scan
  * gigabytes with no time bound now that the old 256KB-per-file cap is gone.
  */
+/** Left of the request budget when the file scan stops, for merging and hydration. */
+const FILE_SCAN_RESERVE_MS = 500;
+
 const searchFileScanTimeoutMs = (): number => {
   const raw = process.env.BUSABASE_SEARCH_FILE_SCAN_TIMEOUT_MS;
   const parsed = raw ? Number(raw) : Number.NaN;
@@ -773,7 +734,12 @@ const scanFileContents = async (
 
   // Wall-clock budget for the WHOLE body-scan phase below (not per file) —
   // computed once, before the loop starts.
-  const deadline = Date.now() + searchFileScanTimeoutMs();
+  // Stops short of the request budget, so running out of time answers with what
+  // was found and `contentTruncated` instead of throwing every match away.
+  const deadline =
+    Date.now() +
+    Math.min(searchFileScanTimeoutMs(), execution.remainingMs() - FILE_SCAN_RESERVE_MS);
+  let scanStopped = false;
   const results: SortableResult[] = [];
 
   for (const row of rows) {
@@ -793,6 +759,7 @@ const scanFileContents = async (
     // Budget check BEFORE starting this candidate's body scan — once the
     // deadline trips, every REMAINING candidate is skipped the same way.
     if (Date.now() >= deadline) {
+      scanStopped = true;
       continue;
     }
     let matchedLine: string | undefined;
@@ -800,6 +767,10 @@ const scanFileContents = async (
       const source = await openAssetTextSource(textRow);
       for await (const line of source.iterateLines()) {
         execution.checkpoint();
+        if (Date.now() >= deadline) {
+          scanStopped = true;
+          break;
+        }
         if (fileMatchesQuery(query, line)) {
           matchedLine = line;
           break;
@@ -821,7 +792,7 @@ const scanFileContents = async (
       break;
     }
   }
-  return { results, scannedAllEligible: !overCap };
+  return { results, scannedAllEligible: !overCap && !scanStopped };
 };
 
 const searchAssetBackedFiles = async (
@@ -1258,7 +1229,15 @@ const searchWithinBudget = async (
 
   await execution.beforeQuery();
   const nodeContent = wantsNodes
-    ? await searchNodeContent(db, spaceId, query, candidateWindow, narrowing, execution)
+    ? await searchNodeContent(
+        db,
+        spaceId,
+        query,
+        candidateWindow,
+        narrowing,
+        parsed.mode,
+        execution,
+      )
     : { results: [] as SortableResult[], truncated: false };
 
   const baseResults = [...baseRowsById.values()].map((base) => ({

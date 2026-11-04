@@ -9,6 +9,11 @@ import type { ComponentProps, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CoreI18nProvider } from "../../../i18n";
 import { EMPTY_WHITEBOARD_FIELD_VALUE } from "../../base/utils/whiteboard-value";
+import { TABLE_CELL_PREVIEW_MAX_CHARS } from "../helpers/table-cell-preview";
+import {
+  LIST_OMITTED_FIELD_VALUE,
+  LIST_OMITTED_LONG_TEXT_VALUE,
+} from "../utils/list-payload-preview";
 
 const routeSearch = vi.hoisted(() => ({ value: "space=connected" }));
 const navigate = vi.hoisted(() => vi.fn());
@@ -410,6 +415,175 @@ describe("table record previews", () => {
     for (const link of links) expect(fireEvent.click(link)).toBe(false);
     expect(onOpenRecord).toHaveBeenCalledTimes(values.length);
     expect(onOpenRecord).toHaveBeenLastCalledWith(richRecord);
+  });
+
+  it("never emits multi-megabyte field values into table text or title attributes", () => {
+    const hugeText = `start ${"x".repeat(1_000_000)} tail-marker`;
+    const longText = field("body", "longtext");
+    const omitted = field("omitted", "longtext");
+    const markdown = field("notes", "markdown");
+    const json = field("source_summary", "json");
+    const richBase = {
+      ...base,
+      fields: [...base.fields, longText, omitted, markdown, json],
+    };
+    const richRecord = {
+      ...record,
+      base: richBase,
+      headCommit: {
+        ...record.headCommit,
+        payload: {
+          ...record.headCommit.payload,
+          body: hugeText,
+          omitted: LIST_OMITTED_LONG_TEXT_VALUE,
+          notes: hugeText,
+          source_summary: {
+            rows: Array.from({ length: 2_000 }, (_, index) => ({ index, text: hugeText })),
+          },
+        },
+      },
+    };
+    const { container } = renderTable({ base: richBase, records: [richRecord] });
+    const boundedLinks = [
+      ...container.querySelectorAll<HTMLAnchorElement>('[data-table-preview-bounded="true"]'),
+    ];
+
+    expect(boundedLinks).toHaveLength(4);
+    for (const link of boundedLinks) {
+      expect(link.textContent).toContain("View full content");
+      expect(link.textContent?.length).toBeLessThan(TABLE_CELL_PREVIEW_MAX_CHARS + 50);
+      expect(link.getAttribute("title")?.length).toBeLessThan(TABLE_CELL_PREVIEW_MAX_CHARS + 50);
+      expect(link.getAttribute("title")).not.toContain("tail-marker");
+    }
+    expect(container.textContent).not.toContain("tail-marker");
+    expect(container.textContent).not.toContain("open the change request");
+  });
+
+  it("shows one record-opening affordance for omitted values of every field type", () => {
+    const types: BaseFieldVO["type"][] = [
+      "relation",
+      "attachment",
+      "whiteboard",
+      "member",
+      "select",
+      "multiselect",
+      "url",
+      "formula",
+      "lookup",
+    ];
+    const omittedFields = types.map((type) => field(`omitted_${type}`, type));
+    const richBase = { ...base, fields: [...base.fields, ...omittedFields] };
+    const richRecord = {
+      ...record,
+      base: richBase,
+      computedFields: {
+        omitted_lookup: {
+          status: "ready",
+          value: LIST_OMITTED_FIELD_VALUE,
+          sources: [],
+        },
+      },
+      headCommit: {
+        ...record.headCommit,
+        payload: {
+          ...record.headCommit.payload,
+          ...Object.fromEntries(omittedFields.map((item) => [item.slug, LIST_OMITTED_FIELD_VALUE])),
+        },
+      },
+    } as unknown as RecordVO;
+    const onOpenRecord = vi.fn();
+    const { container } = renderTable({
+      base: richBase,
+      records: [richRecord],
+      onOpenRecord,
+    });
+
+    const boundedLinks = [
+      ...container.querySelectorAll<HTMLAnchorElement>('[data-table-preview-bounded="true"]'),
+    ];
+    expect(boundedLinks).toHaveLength(types.length);
+    for (const link of boundedLinks) {
+      expect(link.textContent).toBe("View full content");
+    }
+    expect(container.textContent).not.toContain("omitted from the list view");
+    fireEvent.click(boundedLinks[0] as HTMLAnchorElement);
+    expect(onOpenRecord).toHaveBeenCalledWith(richRecord);
+  });
+
+  it("keeps the thumbnail of a whiteboard whose scene the list left out", () => {
+    const board = field("board", "whiteboard");
+    const richBase = { ...base, fields: [...base.fields, board] };
+    const { container } = renderTable({
+      base: richBase,
+      records: [
+        {
+          ...record,
+          base: richBase,
+          headCommit: {
+            ...record.headCommit,
+            payload: {
+              ...record.headCommit.payload,
+              board: {
+                omitted: LIST_OMITTED_FIELD_VALUE,
+                previewSvg: '<svg data-testid="kept-thumbnail" viewBox="0 0 1 1"></svg>',
+              },
+            },
+          },
+        },
+      ],
+    });
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(container.querySelector('[data-table-preview-bounded="true"]')).toBeNull();
+    expect(container.textContent).not.toContain("omitted");
+  });
+
+  it("keeps a long URL clickable with its full target while bounding the text", () => {
+    const website = field("website", "url");
+    const richBase = { ...base, fields: [...base.fields, website] };
+    const longUrl = `https://example.com/?signature=${"a".repeat(400)}`;
+    renderTable({
+      base: richBase,
+      records: [
+        {
+          ...record,
+          base: richBase,
+          headCommit: {
+            ...record.headCommit,
+            payload: { ...record.headCommit.payload, website: longUrl },
+          },
+        },
+      ],
+    });
+    const link = document.querySelector(`a[href^="https://example.com/?signature="]`);
+    expect(link?.getAttribute("href")).toBe(longUrl);
+    expect(link?.textContent?.length).toBeLessThanOrEqual(TABLE_CELL_PREVIEW_MAX_CHARS);
+    expect(link?.getAttribute("title")?.length).toBeLessThanOrEqual(TABLE_CELL_PREVIEW_MAX_CHARS);
+  });
+
+  it("previews a long HTML field as text, without raw or cut-off tags", () => {
+    const page = field("page", "html");
+    const richBase = { ...base, fields: [...base.fields, page] };
+    const { container } = renderTable({
+      base: richBase,
+      records: [
+        {
+          ...record,
+          base: richBase,
+          headCommit: {
+            ...record.headCommit,
+            payload: {
+              ...record.headCommit.payload,
+              page: `<div class="wrap">${"<p>hello</p>".repeat(40)}</div>`,
+            },
+          },
+        },
+      ],
+    });
+    const link = container.querySelector('[data-table-preview-bounded="true"]');
+    expect(link?.textContent).toContain("hello");
+    expect(link?.textContent).toContain("View full content");
+    expect(link?.textContent).not.toContain("<");
+    expect(link?.getAttribute("title")).not.toContain("<");
   });
 
   it("keeps row selection and external, relation and attachment targets independent", () => {

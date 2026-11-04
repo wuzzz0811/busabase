@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { createRouterClient } from "@orpc/server";
 import { eq } from "drizzle-orm";
-import { storage } from "openlib/storage";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { LocalStorage, storage } from "openlib/storage";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getDb } from "../src/db";
 import { busabaseAssetUsages } from "../src/domains/assets/schema/assets";
 import { busabaseRouter } from "../src/router";
@@ -122,4 +122,31 @@ describe("search — files source content matching, ordinary (uncapped) case", (
     expect(result.results.map((r) => r.title)).toContain("quarterly-notes.txt");
     expect(result.contentTruncated).toBe(false);
   });
+
+  // Production: `sources=files&mode=full` answered 408 for words in no file. The
+  // scan's own 5 s limit equalled the 5 s request budget, so the request deadline
+  // always tripped first and threw away the honest partial answer.
+  it("answers with contentTruncated when the scan runs out of request budget", async () => {
+    for (let index = 0; index < 6; index++) {
+      const assetId = await uploadAsset(`slow-${index}.txt`, `body ${index}\n`, String(index + 2));
+      await mountAsFileNode(assetId, `slow-${index}`, `Slow ${index}`);
+    }
+    const original = LocalStorage.prototype.objectExists;
+    const spy = vi.spyOn(LocalStorage.prototype, "objectExists").mockImplementation(async function (
+      this: LocalStorage,
+      key: string,
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return original.call(this, key);
+    });
+    process.env.BUSABASE_SEARCH_FULL_REQUEST_TIMEOUT_MS = "1500";
+    try {
+      const result = await client.search({ query: "in-no-file-at-all", sources: ["files"] });
+      expect(result.results).toHaveLength(0);
+      expect(result.contentTruncated).toBe(true);
+    } finally {
+      delete process.env.BUSABASE_SEARCH_FULL_REQUEST_TIMEOUT_MS;
+      spy.mockRestore();
+    }
+  }, 60_000);
 });

@@ -483,19 +483,23 @@ export const putAssetText = async (input: PutTextInput): Promise<AssetTextVO> =>
     : canonicalKey;
   const previousKey = existing?.writtenBy !== "auto" ? existing?.textStorageKey : undefined;
   for (let attempt = 0; ; attempt += 1) {
+    // Write the bytes BEFORE the fence: HEAD/PUT/COPY are network I/O, and a
+    // row lock held across them parks a pooled connection (and the key) for
+    // the whole transfer. The fence below still decides acceptance; a key
+    // retired in between is rejected with CONFLICT and retried on a fresh key.
+    const alreadyStored = await storage.objectExists(finalKey).catch(() => false);
+    if (!alreadyStored) {
+      if (inlineBytes) {
+        await storage.uploadFileToKey(inlineBytes, finalKey, "text/plain; charset=utf-8");
+      } else {
+        await storage.copyObject(input.storageKey as string, finalKey);
+      }
+    }
     try {
       await withStorageKeyRegistration(
         db,
         finalKey,
         async (tx) => {
-          const alreadyStored = await storage.objectExists(finalKey).catch(() => false);
-          if (!alreadyStored) {
-            if (inlineBytes) {
-              await storage.uploadFileToKey(inlineBytes, finalKey, "text/plain; charset=utf-8");
-            } else {
-              await storage.copyObject(input.storageKey as string, finalKey);
-            }
-          }
           const rowId = await upsertAssetTextRow(tx, spaceId, input.assetId, existing, {
             status: "present",
             textStorageKey: finalKey,
@@ -516,7 +520,11 @@ export const putAssetText = async (input: PutTextInput): Promise<AssetTextVO> =>
       );
       break;
     } catch (error) {
-      if (!(error instanceof ORPCError) || error.code !== "CONFLICT" || attempt >= 2) throw error;
+      const retired = error instanceof ORPCError && error.code === "CONFLICT";
+      // A retired key may already be past its final sweep, so nothing would
+      // ever collect bytes written to it here. Remove only what this call wrote.
+      if (retired && !alreadyStored) await storage.deleteObject(finalKey).catch(() => {});
+      if (!retired || attempt >= 2) throw error;
       finalKey = `${canonicalKey}.${generateNanoID("gen", 16)}`;
     }
   }

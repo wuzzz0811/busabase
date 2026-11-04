@@ -62,7 +62,11 @@ afterEach(() => {
   for (const trigger of triggers.splice(0)) trigger.remove();
 });
 
-function renderDialog(locale: CoreLocale = "en", visitorKind: "member" | "anonymous" = "member") {
+function renderDialog(
+  locale: CoreLocale = "en",
+  visitorKind: "member" | "anonymous" = "member",
+  state: { record?: RecordVO | null; isLoading?: boolean } = {},
+) {
   const location = memoryLocation({
     path: "/base/customers/calendar?space=tnl_test",
     record: true,
@@ -80,8 +84,9 @@ function renderDialog(locale: CoreLocale = "en", visitorKind: "member" | "anonym
         baseSlug="customers"
         client={client}
         onClose={() => setOpen(false)}
+        isLoading={state.isLoading}
         onDeleteChangeRequest={async () => undefined}
-        record={record}
+        record={state.record === undefined ? record : state.record}
         records={[record]}
         returnFocusTo={trigger}
       />
@@ -105,6 +110,24 @@ function renderDialog(locale: CoreLocale = "en", visitorKind: "member" | "anonym
 }
 
 describe("record detail dialog", () => {
+  it("shows a loading state, not a not-found message, until the full record arrives", () => {
+    renderDialog("en", "member", { record: null, isLoading: true });
+    const dialog = screen.getByTestId("record-detail-dialog");
+    expect(within(dialog).queryByText(coreMessagesByLocale.en.recordView.recordNotFoundTitle)).toBe(
+      null,
+    );
+    expect(dialog.querySelector("[aria-hidden]")).not.toBeNull();
+  });
+
+  it("still reports not found once loading has settled without a record", () => {
+    renderDialog("en", "member", { record: null, isLoading: false });
+    expect(
+      within(screen.getByTestId("record-detail-dialog")).getByText(
+        coreMessagesByLocale.en.recordView.recordNotFoundTitle,
+      ),
+    ).toBeTruthy();
+  });
+
   it.each(["en", "zh-CN"] as const)(
     "shows a visible localized full-page link and the shared detail content in %s",
     (locale) => {

@@ -86,6 +86,11 @@ import { fieldDesignHref } from "../helpers/field-visibility-navigation";
 import { fieldValueToString, shortIdentifier } from "../helpers/format";
 import { mergeSearchIntoHref, useHrefWithCurrentSearch } from "../helpers/link-search";
 import {
+  buildTableCellPreview,
+  TABLE_CELL_LINK_MAX_CHARS,
+  TABLE_CELL_PREVIEW_MAX_CHARS,
+} from "../helpers/table-cell-preview";
+import {
   canonicalizeViewFieldConfig,
   clampViewFieldWidth,
   getVisibleViewFieldSlugs,
@@ -105,6 +110,7 @@ import type {
   ViewSubmitOptions,
   ViewUpdatePayload,
 } from "../helpers/view-types";
+import { getOmittedWhiteboardPreview, isListPayloadOmitted } from "../utils/list-payload-preview";
 import { toSlugInput } from "../utils/slug-input";
 import { useIsAnonymousVisitor } from "../visitor-context";
 import { BusaBaseCalendar } from "./base-calendar";
@@ -2434,12 +2440,42 @@ function RecordTableCellContent({
     onOpenRecord(record);
   };
 
+  // Every field type shares one affordance for a value the list left out, before
+  // any renderer can mistake the marker for an id, a label or an empty value.
+  const computedLookup = field.type === "lookup" ? record.computedFields?.[field.slug] : undefined;
+  const omittedWhiteboardPreview =
+    kind === "whiteboard" ? getOmittedWhiteboardPreview(rawValue) : null;
+  if (
+    !omittedWhiteboardPreview &&
+    isListPayloadOmitted(computedLookup ? computedLookup.value : rawValue)
+  ) {
+    return (
+      <Link
+        className="flex min-w-0 items-center gap-2 py-1 text-muted-foreground"
+        href={currentRecordHref}
+        onClick={openRecord}
+        title={messages.operation.viewFullContent}
+        data-table-preview-bounded="true"
+      >
+        {index === 0 ? (
+          <span className="h-4 w-4 shrink-0 rounded border border-border/70 bg-muted/40" />
+        ) : null}
+        <span
+          className={`${index === 0 ? "" : "ml-auto"} shrink-0 text-[10px] text-muted-foreground no-underline`}
+        >
+          {messages.operation.viewFullContent}
+        </span>
+      </Link>
+    );
+  }
+
   if (field.type === "lookup") {
     return (
       <LookupFieldValue
-        computed={record.computedFields?.[field.slug]}
+        computed={computedLookup}
         field={field}
         fieldUsers={record.fieldUsers}
+        presentation="grid"
         records={records}
         value={rawValue}
       />
@@ -2561,7 +2597,7 @@ function RecordTableCellContent({
   }
 
   if (kind === "whiteboard") {
-    const { previewSvg } = parseWhiteboardFieldValue(rawValue);
+    const previewSvg = omittedWhiteboardPreview ?? parseWhiteboardFieldValue(rawValue).previewSvg;
     if (!previewSvg) {
       return (
         <div className="min-w-0 truncate py-1 text-muted-foreground text-sm" title="-">
@@ -2629,6 +2665,25 @@ function RecordTableCellContent({
   }
 
   if (kind === "link") {
+    const preview = buildTableCellPreview(rawValue);
+    // Long signed URLs stay clickable: only the displayed text is bounded.
+    if (
+      typeof rawValue === "string" ? rawValue.length > TABLE_CELL_LINK_MAX_CHARS : preview.truncated
+    ) {
+      return (
+        <Link
+          className="flex min-w-0 items-center py-1 text-muted-foreground"
+          href={currentRecordHref}
+          onClick={openRecord}
+          title={messages.operation.viewFullContent}
+          data-table-preview-bounded="true"
+        >
+          <span className="ml-auto shrink-0 text-[10px] text-muted-foreground no-underline">
+            {messages.operation.viewFullContent}
+          </span>
+        </Link>
+      );
+    }
     const value = fieldValueToString(rawValue).trim();
     if (!value) {
       return (
@@ -2650,18 +2705,19 @@ function RecordTableCellContent({
         href={`${prefix}${value}`}
         rel={external ? "noreferrer" : undefined}
         target={external ? "_blank" : undefined}
-        title={value}
+        title={preview.text}
       >
-        <span className="min-w-0 truncate">{value}</span>
+        <span className="min-w-0 truncate">{preview.text}</span>
         {external ? <ExternalLink className="shrink-0" size={12} /> : null}
       </a>
     );
   }
 
   if (["markdown", "code", "json", "yaml"].includes(field.type)) {
-    const source = fieldValueToString(rawValue);
-    const summary = source.replace(/\s+/g, " ").trim();
-    if (!summary) {
+    const preview = buildTableCellPreview(rawValue);
+    const showOpenRecord = preview.truncated;
+    const summary = preview.text;
+    if (!summary && !showOpenRecord) {
       return (
         <Link
           className="flex min-w-0 items-center py-1 text-muted-foreground"
@@ -2675,16 +2731,26 @@ function RecordTableCellContent({
     }
     return (
       <Link
-        className={`block min-w-0 truncate py-1 underline-offset-2 hover:underline ${
+        className={`flex min-w-0 items-center py-1 underline-offset-2 hover:underline ${
           field.type === "markdown"
             ? "text-muted-foreground"
             : "font-mono text-muted-foreground text-xs"
         }`}
         href={currentRecordHref}
         onClick={openRecord}
-        title={source}
+        title={
+          preview.truncated
+            ? `${summary ? `${summary} - ` : ""}${messages.operation.viewFullContent}`
+            : summary
+        }
+        data-table-preview-bounded={showOpenRecord ? "true" : undefined}
       >
-        {summary}
+        <span className="min-w-0 truncate">{summary}</span>
+        {showOpenRecord ? (
+          <span className="ml-2 shrink-0 text-[10px] text-muted-foreground no-underline">
+            {messages.operation.viewFullContent}
+          </span>
+        ) : null}
       </Link>
     );
   }
@@ -2742,7 +2808,24 @@ function RecordTableCellContent({
     );
   }
 
-  const value = getFieldPreviewText(field, rawValue, messages, locale);
+  const preview = buildTableCellPreview(rawValue);
+  const showOpenRecord = preview.truncated;
+  // Format the bounded slice, not the raw value, so a long HTML field still
+  // previews as text. Its cut-off trailing tag has no `>` for the stripper.
+  const formattedValue = getFieldPreviewText(
+    field,
+    !preview.truncated
+      ? rawValue
+      : field.type === "html"
+        ? preview.text.replace(/<[^>]*$/, "")
+        : preview.text,
+    messages,
+    locale,
+  );
+  const value =
+    formattedValue.length > TABLE_CELL_PREVIEW_MAX_CHARS
+      ? buildTableCellPreview(formattedValue).text
+      : formattedValue;
 
   return (
     <Link
@@ -2751,12 +2834,26 @@ function RecordTableCellContent({
       }`}
       href={currentRecordHref}
       onClick={openRecord}
-      title={value}
+      title={
+        preview.truncated
+          ? `${value ? `${value} - ` : ""}${messages.operation.viewFullContent}`
+          : value
+      }
+      data-table-preview-bounded={showOpenRecord ? "true" : undefined}
     >
       {index === 0 ? (
         <span className="h-4 w-4 shrink-0 rounded border border-border/70 bg-muted/40" />
       ) : null}
       <span className="min-w-0 truncate">{value || "-"}</span>
+      {showOpenRecord ? (
+        <span
+          className={`${
+            index === 0 ? "" : "ml-auto"
+          } shrink-0 text-[10px] text-muted-foreground no-underline`}
+        >
+          {messages.operation.viewFullContent}
+        </span>
+      ) : null}
       {index === 0 ? (
         <ChevronRight
           className="ml-auto shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CoreI18nProvider } from "../../../i18n";
 import { AttachmentValuePreview } from "./attachment-value-preview";
 
@@ -24,6 +24,117 @@ function show(value: unknown, compact = true) {
 afterEach(cleanup);
 
 describe("attachment field previews", () => {
+  it("recomputes a single-line grid prefix and recovers focus if resize removes the opener", async () => {
+    let width = 166;
+    let resize = () => {};
+    const bounds = vi
+      .spyOn(HTMLElement.prototype, "clientWidth", "get")
+      .mockImplementation(() => width);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: (entries: { contentRect: { width: number } }[]) => void) {
+          resize = () => callback([{ contentRect: { width } }]);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    try {
+      const result = render(
+        <CoreI18nProvider locale="en">
+          <AttachmentValuePreview
+            presentation="grid"
+            value={[file("one"), file("two", "application/pdf")]}
+          />
+        </CoreI18nProvider>,
+      );
+      const grid = result.container.querySelector("[data-attachment-preview]") as HTMLElement;
+      expect(grid.dataset.attachmentVisibleCount).toBe("2");
+      width = 165;
+      act(() => resize());
+      expect(grid.dataset.attachmentVisibleCount).toBe("1");
+      expect(within(grid).getByText("+1")).toBeTruthy();
+      fireEvent.click(within(grid).getByRole("link", { name: "one.png" }));
+      width = 30;
+      act(() => resize());
+      expect(grid.dataset.attachmentVisibleCount).toBe("0");
+      fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+      expect(within(grid).getByRole("button", { name: /Open: 2/i })).toBeTruthy();
+    } finally {
+      bounds.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps duplicate asset occurrences separately selectable and restores overflow focus", async () => {
+    const duplicated = { ...file("same"), assetId: "ast_same" };
+    show([duplicated, file("middle"), duplicated, duplicated]);
+    const opener = screen.getByText("+1");
+    fireEvent.click(opener);
+    const dialog = screen.getByRole("dialog");
+    const choices = within(dialog).getAllByRole("button", { name: "same.png" });
+    expect(choices).toHaveLength(3);
+    expect(choices.map((button) => button.getAttribute("aria-pressed"))).toEqual([
+      "false",
+      "false",
+      "true",
+    ]);
+    fireEvent.click(choices[1] as HTMLElement);
+    expect(choices.map((button) => button.getAttribute("aria-pressed"))).toEqual([
+      "false",
+      "true",
+      "false",
+    ]);
+    expect(
+      within(dialog).getByRole("link", { name: "Download file" }).getAttribute("href"),
+    ).toContain("/api/assets/ast_same/raw");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("preserves modified browser clicks without opening a dialog", () => {
+    show([file("photo")]);
+    const link = screen.getByRole("link", { name: "photo.png" });
+    expect(fireEvent.click(link, { ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("falls back to the current attachment when an open selection is removed", () => {
+    const result = show([file("first"), file("removed")], false);
+    fireEvent.click(screen.getByRole("link", { name: "removed.png" }));
+    result.rerender(
+      <CoreI18nProvider locale="en">
+        <AttachmentValuePreview value={[file("first")]} />
+      </CoreI18nProvider>,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "first.png" })).toBeTruthy();
+    expect(within(dialog).queryByRole("img", { name: "removed.png" })).toBeNull();
+    expect(within(dialog).getByRole("img", { name: "first.png" }).getAttribute("src")).toBe(
+      "https://example.com/first",
+    );
+  });
+
+  it("keeps failed grid files identifiable and retries without opening the preview", () => {
+    const bounds = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(160);
+    try {
+      render(
+        <CoreI18nProvider locale="en">
+          <AttachmentValuePreview presentation="grid" value={[file("failed")]} />
+        </CoreI18nProvider>,
+      );
+      fireEvent.error(screen.getByRole("img", { name: "failed.png" }));
+      const link = screen.getByRole("link", { name: "failed.png" });
+      expect(link.getAttribute("href")).toBe("https://example.com/failed");
+      fireEvent.click(screen.getByRole("button", { name: "Retry: failed.png" }));
+      expect(screen.getByRole("img", { name: "failed.png" })).toBeTruthy();
+      expect(screen.queryByRole("dialog")).toBeNull();
+    } finally {
+      bounds.mockRestore();
+    }
+  });
   it("keeps mixed files in the user's order and makes overflow accessible", () => {
     const files = [file("report", "application/pdf"), file("photo"), file("second"), file("last")];
     const { container } = show(files);
