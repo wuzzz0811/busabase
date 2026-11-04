@@ -25,6 +25,9 @@ export default defineConfig({
     "agent-fidelity-live.spec.ts",
     "agent-fidelity.spec.ts",
     "agent-source-fidelity.spec.ts",
+    "agent-session-supervision.spec.ts",
+    "agent-permission.spec.ts",
+    "agent-permission-live.spec.ts",
   ],
   // The dashboard is a client SPA that streams its RSC response, so each full-page
   // navigation reloads the bundle and refetches over RPC before content mounts.
